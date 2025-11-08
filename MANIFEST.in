@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+include requirements.txt
+include config.example.json
+recursive-include f1_predictor *.py
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude .f1_cache *
