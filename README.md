@@ -1,16 +1,16 @@
-# F1 Race Predictor
+# 🏎️ F1 Race Predictor
 
 A Python command-line tool that predicts Formula 1 race winners using historical performance data, qualifying results, and statistical analysis.
 
-## Features
+## ✨ Features
 
-- **Data-Driven Predictions**: Analyzes multiple factors including driver form, team performance, qualifying positions, and circuit history
-- **Confidence Scores**: Provides confidence percentages for each prediction based on data quality and factor weights
-- **Smart Caching**: Caches API responses locally to improve performance and reduce API calls
-- **Detailed Analysis**: Optional verbose mode shows factor breakdowns and scoring details
-- **Easy to Use**: Simple command-line interface with sensible defaults
+- **📊 Data-Driven Predictions**: Analyzes multiple factors including driver form, team performance, qualifying positions, and circuit history
+- **🎯 Confidence Scores**: Provides confidence percentages for each prediction based on data quality and factor weights
+- **⚡ Smart Caching**: Caches API responses locally to improve performance and reduce API calls
+- **🔍 Detailed Analysis**: Optional verbose mode shows factor breakdowns and scoring details
+- **🚀 Easy to Use**: Simple command-line interface with sensible defaults
 
-## Installation
+## 📦 Installation
 
 ### Prerequisites
 
@@ -46,7 +46,7 @@ After installation, you can run:
 f1-predictor
 ```
 
-## Usage
+## 🎮 Usage
 
 ### Basic Usage
 
@@ -86,17 +86,17 @@ Combine multiple options:
 python -m f1_predictor.cli --verbose --top 5 --no-cache
 ```
 
-## Prediction Methodology
+## 🧮 Prediction Methodology
 
 The predictor uses a weighted scoring model that combines multiple factors to generate predictions:
 
 ### Scoring Factors
 
-1. **Championship Position (25%)**: Current driver standings in the championship
-2. **Recent Form (20%)**: Performance in the last 5 races
-3. **Team Performance (20%)**: Constructor championship standings
-4. **Qualifying Position (20%)**: Grid position from qualifying session
-5. **Circuit History (15%)**: Historical performance at the specific circuit
+1. **🏆 Championship Position (25%)**: Current driver standings in the championship
+2. **📈 Recent Form (20%)**: Performance in the last 5 races
+3. **🏁 Team Performance (20%)**: Constructor championship standings
+4. **⏱️ Qualifying Position (20%)**: Grid position from qualifying session
+5. **🗺️ Circuit History (15%)**: Historical performance at the specific circuit
 
 ### Confidence Calculation
 
@@ -112,13 +112,13 @@ The confidence score is adjusted based on data availability. For example:
 - If circuit history is limited, confidence is adjusted accordingly
 - New drivers or teams receive lower confidence scores
 
-### Data Sources
+### 🌐 Data Sources
 
 - **Primary API**: [Jolpica F1 API](https://api.jolpi.ca/ergast) - A modern replacement for the discontinued Ergast API
 - **Data Coverage**: Historical F1 data from 1950 to present
 - **Update Frequency**: Real-time during race weekends
 
-### Caching Strategy
+### 💾 Caching Strategy
 
 To improve performance and reduce API load, the predictor caches data with the following TTL (Time To Live) values:
 
@@ -131,7 +131,7 @@ To improve performance and reduce API load, the predictor caches data with the f
 
 Cache files are stored in the `.f1_cache/` directory.
 
-## Output Format
+## 📋 Output Format
 
 ### Standard Output
 
@@ -174,11 +174,11 @@ With `--verbose` flag, additional factor breakdowns are shown:
    • Circuit History: 2 wins at Monaco → 15.0 pts (weight: 15%)
 ```
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
 ### Common Issues
 
-#### "Network error: Unable to connect to API"
+#### ❌ "Network error: Unable to connect to API"
 
 **Cause**: Cannot reach the Jolpica F1 API
 
@@ -188,7 +188,7 @@ With `--verbose` flag, additional factor breakdowns are shown:
 - Try again later if the API is temporarily down
 - Use cached data if available (remove `--no-cache` flag)
 
-#### "No qualifying data available yet"
+#### ⚠️ "No qualifying data available yet"
 
 **Cause**: Qualifying session hasn't occurred or data isn't published yet
 
@@ -234,7 +234,7 @@ If you encounter persistent issues:
 3. Try running with `--verbose` for detailed output
 4. Clear cache and try again: `rm -rf .f1_cache`
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 f1-race-predictor/
@@ -253,7 +253,7 @@ f1-race-predictor/
 └── README.md               # This file
 ```
 
-## Development
+## 🛠️ Development
 
 ### Running Tests
 
@@ -265,13 +265,13 @@ python -m pytest tests/
 
 This project follows PEP 8 style guidelines.
 
-## Attribution
+## 🙏 Attribution
 
 - **F1 Data**: Provided by [Jolpica F1 API](https://api.jolpi.ca/ergast)
 - **Original API**: Based on the Ergast Developer API structure
 - **Data License**: Check Jolpica F1 API terms of use
 
-## Limitations
+## ⚠️ Limitations
 
 - Predictions are statistical estimates and not guarantees
 - Accuracy depends on data quality and availability
@@ -279,21 +279,21 @@ This project follows PEP 8 style guidelines.
 - Limited effectiveness for new drivers or teams with minimal historical data
 - Cannot predict unexpected events (crashes, safety cars, strategy variations)
 
-## Future Enhancements
+## 🚀 Future Enhancements
 
 Potential improvements for future versions:
 
-- Machine learning models for more sophisticated predictions
-- Weather forecast integration
-- Live updates during race weekends
-- Web-based interface
-- Historical accuracy tracking
-- Driver-specific factors (tire strategy, wet weather performance)
+- 🤖 Machine learning models for more sophisticated predictions
+- 🌦️ Weather forecast integration
+- 📡 Live updates during race weekends
+- 🌐 Web-based interface
+- 📊 Historical accuracy tracking
+- 🏎️ Driver-specific factors (tire strategy, wet weather performance)
 
 ## License
 
-[Add your license information here]
+Eduardo Noyola
 
 ## Contributing
 
-[Add contribution guidelines here]
+N/A
