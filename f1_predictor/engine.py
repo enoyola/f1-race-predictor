@@ -42,7 +42,8 @@ class PredictionEngine:
         use_cache: bool = True,
         cache_dir: str = ".f1_cache",
         top_n: int = 3,
-        verbose: bool = False
+        verbose: bool = False,
+        use_ml: bool = False
     ):
         """
         Initialize the prediction engine.
@@ -52,15 +53,26 @@ class PredictionEngine:
             cache_dir: Directory for cache storage (default: ".f1_cache")
             top_n: Number of top predictions to generate (default: 3)
             verbose: Whether to show detailed output (default: False)
+            use_ml: Whether to use ML model instead of statistical analysis (default: False)
         """
         self.use_cache = use_cache
         self.top_n = top_n
         self.verbose = verbose
+        self.use_ml = use_ml
         
         # Initialize components
         self.cache = DataCache(cache_dir) if use_cache else None
         self.data_fetcher = F1DataFetcher(cache=self.cache, use_cache=use_cache)
-        self.analyzer = PredictionAnalyzer()
+        
+        # Choose analyzer based on mode
+        if use_ml:
+            from f1_predictor.ml_analyzer import MLPredictionAnalyzer
+            self.analyzer = MLPredictionAnalyzer()
+            logger.info("Using ML-based prediction analyzer")
+        else:
+            self.analyzer = PredictionAnalyzer()
+            logger.info("Using statistical prediction analyzer")
+        
         self.formatter = ResultFormatter()
         
         logger.info("Prediction engine initialized")

@@ -26,6 +26,7 @@ Examples:
   f1-predictor --top 5            # Show top 5 predictions
   f1-predictor --verbose          # Show detailed factor analysis
   f1-predictor --no-cache         # Disable caching
+  f1-predictor --ml               # Use machine learning model
   f1-predictor --verbose --top 5  # Combine options
         """
     )
@@ -68,6 +69,13 @@ Examples:
         help='Disable caching and fetch fresh data from API'
     )
     
+    # ML options
+    parser.add_argument(
+        '--ml',
+        action='store_true',
+        help='Use machine learning model instead of statistical analysis'
+    )
+    
     args = parser.parse_args()
     
     # Validate arguments
@@ -101,7 +109,8 @@ def main() -> int:
         engine = PredictionEngine(
             use_cache=use_cache,
             top_n=args.top,
-            verbose=args.verbose
+            verbose=args.verbose,
+            use_ml=args.ml
         )
         
         # Show initial message
