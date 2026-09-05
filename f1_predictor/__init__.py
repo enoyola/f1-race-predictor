@@ -1,3 +1,3 @@
-"""F1 Race Predictor - A tool for predicting Formula 1 race winners."""
+"""F1 Race Predictor - predict Formula 1 race winners from historical data."""
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"

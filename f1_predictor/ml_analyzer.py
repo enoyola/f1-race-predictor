@@ -1,287 +1,111 @@
 """
-Machine Learning-based prediction analyzer.
+Machine-learning prediction analyzer.
 
-Uses trained Random Forest model to predict race winners instead of fixed weights.
-Falls back to statistical analysis if model is not available.
+Loads a trained model bundle (see training.py) and predicts win and podium
+probabilities from the same point-in-time features the statistical analyzer
+uses. Falls back to the statistical analyzer when no usable model exists.
 """
 
 import logging
-import pickle
 import os
-from typing import List, Dict, Optional
+from typing import List, Optional
+
 import numpy as np
 
-from f1_predictor.models import (
-    Race, Driver, Constructor, RaceResult, QualifyingResult,
-    DriverStanding, ConstructorStanding, DriverPrediction
-)
 from f1_predictor.analyzer import PredictionAnalyzer
+from f1_predictor.features import FEATURE_NAMES, extract_all
+from f1_predictor.models import DriverPrediction, RaceContext
+from f1_predictor.probability import normalize, scale_to_sum
+from f1_predictor.training import DEFAULT_MODEL_PATH, load_bundle, resolve_model_path
 
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class MLPredictionAnalyzer(PredictionAnalyzer):
-    """
-    Machine Learning-based analyzer that extends the statistical analyzer.
-    
-    Uses a trained Random Forest model to predict race winners. If the model
-    is not available, falls back to the statistical method from parent class.
-    
-    The ML model learns optimal feature weights from historical data instead
-    of using fixed weights.
-    """
-    
-    def __init__(self, model_path: str = 'models/f1_predictor.pkl'):
-        """
-        Initialize ML analyzer.
-        
-        Args:
-            model_path: Path to trained model file
-        """
+    """Analyzer backed by a trained scikit-learn bundle, with statistical fallback."""
+
+    name = "ml"
+
+    def __init__(self, model_path: Optional[str] = None, bundle: Optional[dict] = None):
         super().__init__()
-        self.model_path = model_path
-        self.model = None
-        self.model_loaded = False
-        
-        # Try to load the model
-        self._load_model()
-    
-    def _load_model(self):
-        """Load the trained ML model from disk."""
-        if not os.path.exists(self.model_path):
-            logger.warning(
-                f"ML model not found at {self.model_path}. "
-                "Run train_model.py to train a model, or use statistical mode."
+        self.model_path = resolve_model_path(model_path or DEFAULT_MODEL_PATH)
+        self.bundle: Optional[dict] = None
+        self.win_model = None
+        self.podium_model = None
+        self.load_error: Optional[str] = None
+        if bundle is not None:
+            self._adopt_bundle(bundle)
+        else:
+            self._load_model()
+
+    @property
+    def model_loaded(self) -> bool:
+        return self.win_model is not None
+
+    def _adopt_bundle(self, bundle: dict) -> None:
+        names = bundle.get("feature_names")
+        if names != FEATURE_NAMES:
+            self.load_error = (
+                "Model was trained with a different feature set; retrain with `python train_model.py`."
             )
+            logger.warning(self.load_error)
             return
-        
+        self.bundle = bundle
+        self.win_model = bundle["win_model"]
+        self.podium_model = bundle.get("podium_model")
+
+    def _load_model(self) -> None:
+        if not os.path.exists(self.model_path):
+            self.load_error = f"ML model not found at {self.model_path}. Run `python train_model.py` first."
+            logger.warning(self.load_error)
+            return
         try:
-            with open(self.model_path, 'rb') as f:
-                self.model = pickle.load(f)
-            self.model_loaded = True
-            logger.info(f"ML model loaded successfully from {self.model_path}")
-        except Exception as e:
-            logger.error(f"Failed to load ML model: {e}")
-            logger.warning("Falling back to statistical analysis")
-    
-    def _extract_features_for_driver(
-        self,
-        driver: Driver,
-        constructor: Constructor,
-        driver_standing: DriverStanding,
-        driver_standings: List[DriverStanding],
-        constructor_standings: List[ConstructorStanding],
-        recent_results: List[RaceResult],
-        qualifying_position: Optional[int],
-        circuit_history: Optional[List[RaceResult]],
-        race: Race
-    ) -> np.ndarray:
-        """
-        Extract feature vector for a single driver.
-        
-        Uses the same feature calculations as the statistical model,
-        but returns them as a numpy array for ML prediction.
-        
-        Args:
-            driver: Driver to extract features for
-            constructor: Driver's constructor
-            driver_standing: Driver's championship standing
-            driver_standings: All driver standings
-            constructor_standings: All constructor standings
-            recent_results: Recent race results
-            qualifying_position: Qualifying position (if available)
-            circuit_history: Historical results at circuit (if available)
-            race: Race being predicted
-            
-        Returns:
-            Numpy array of features [championship, form, team, qualifying, circuit]
-        """
-        # Calculate same features as statistical model
-        championship_score = self.calculate_championship_score(driver, driver_standings)
-        form_score = self.calculate_driver_form(driver, recent_results)
-        team_score = self.calculate_team_performance(constructor, constructor_standings)
-        
-        # Qualifying score
-        if qualifying_position:
-            qualifying_score = self.calculate_qualifying_impact(qualifying_position)
-        else:
-            qualifying_score = 50.0  # Neutral if not available
-        
-        # Circuit history score
-        if circuit_history:
-            circuit_score = self.calculate_circuit_advantage(
-                driver, race.circuit.circuit_id, circuit_history
-            )
-        else:
-            circuit_score = 50.0  # Neutral if not available
-        
-        # Return as numpy array
-        features = np.array([
-            championship_score,
-            form_score,
-            team_score,
-            qualifying_score,
-            circuit_score
-        ])
-        
-        return features
-    
-    def analyze(
-        self,
-        race: Race,
-        driver_standings: List[DriverStanding],
-        constructor_standings: List[ConstructorStanding],
-        recent_results: List[RaceResult],
-        qualifying_results: Optional[List[QualifyingResult]] = None,
-        circuit_history: Optional[List[RaceResult]] = None,
-        top_n: int = 3
-    ) -> List[DriverPrediction]:
-        """
-        Generate race winner predictions using ML model.
-        
-        If ML model is not available, falls back to statistical analysis.
-        
-        Args:
-            race: Race to predict
-            driver_standings: Current driver championship standings
-            constructor_standings: Current constructor championship standings
-            recent_results: Recent race results for form calculation
-            qualifying_results: Qualifying results for this race (optional)
-            circuit_history: Historical results at this circuit (optional)
-            top_n: Number of top predictions to return (default: 3)
-            
-        Returns:
-            List of DriverPrediction objects sorted by confidence (highest first)
-        """
-        # Fall back to statistical if model not loaded
+            bundle = load_bundle(self.model_path)
+        except Exception as e:  # corrupt or incompatible pickle
+            self.load_error = f"Failed to load ML model: {e}"
+            logger.error(self.load_error)
+            return
+        self._adopt_bundle(bundle)
+        if self.model_loaded:
+            logger.info("ML model loaded from %s (trained %s)", self.model_path, bundle.get("trained_at", "?"))
+
+    def analyze(self, context: RaceContext, top_n: Optional[int] = None) -> List[DriverPrediction]:
         if not self.model_loaded:
             logger.info("Using statistical analysis (ML model not available)")
-            return super().analyze(
-                race, driver_standings, constructor_standings,
-                recent_results, qualifying_results, circuit_history, top_n
-            )
-        
-        # Validate inputs
-        if not race or not driver_standings:
-            logger.error("Invalid input data for prediction")
+            return super().analyze(context, top_n)
+        if not context.entries:
             return []
-        
-        logger.info(f"Analyzing race with ML model: {race.race_name}")
-        
-        # Track data completeness
-        total_factors = 5
-        available_factors = 3  # Championship, form, and team always available
-        if qualifying_results:
-            available_factors += 1
-        if circuit_history:
-            available_factors += 1
-        
-        data_completeness = available_factors / total_factors
-        logger.info(f"Data completeness: {data_completeness:.1%}")
-        
-        predictions = []
-        
-        # Extract features and predict for each driver
-        for driver_standing in driver_standings:
-            try:
-                driver = driver_standing.driver
-                constructor = driver_standing.constructor
-                
-                # Validate driver data
-                if not driver or not driver.driver_id:
-                    continue
-                if not constructor or not constructor.constructor_id:
-                    continue
-                
-                # Find qualifying position if available
-                qualifying_position = None
-                if qualifying_results:
-                    for qual_result in qualifying_results:
-                        if qual_result.driver.driver_id == driver.driver_id:
-                            qualifying_position = qual_result.position
-                            break
-                
-                # Extract features
-                features = self._extract_features_for_driver(
-                    driver=driver,
-                    constructor=constructor,
-                    driver_standing=driver_standing,
-                    driver_standings=driver_standings,
-                    constructor_standings=constructor_standings,
-                    recent_results=recent_results,
-                    qualifying_position=qualifying_position,
-                    circuit_history=circuit_history,
-                    race=race
+
+        all_features = extract_all(context)
+        X = np.array([f.vector() for f in all_features], dtype=float)
+
+        raw_win = self.win_model.predict_proba(X)[:, 1]
+        win_probs = normalize(raw_win)
+        if self.podium_model is not None:
+            raw_podium = self.podium_model.predict_proba(X)[:, 1]
+            podium_probs = scale_to_sum(raw_podium, target=3.0, cap=1.0)
+        else:
+            from f1_predictor.probability import plackett_luce_top3
+            podium_probs = plackett_luce_top3(win_probs)
+
+        predictions: List[DriverPrediction] = []
+        for features, p_win, p_podium, raw in zip(all_features, win_probs, podium_probs, raw_win):
+            factors = self.score_features(features, context)
+            reasoning = self.generate_reasoning(features, context, factors)
+            reasoning.insert(0, f"Model win probability: {p_win * 100:.1f}% (raw {raw * 100:.1f}%)")
+            predictions.append(
+                DriverPrediction(
+                    driver=features.entry.driver,
+                    constructor=features.entry.constructor,
+                    win_probability=p_win,
+                    podium_probability=p_podium,
+                    score=float(raw) * 100,
+                    factors=dict(features.factors),
+                    reasoning=reasoning,
+                    grid_position=features.qualifying_position,
                 )
-                
-                # Predict using ML model
-                # Reshape for single prediction: (1, n_features)
-                features_reshaped = features.reshape(1, -1)
-                
-                # Get probability prediction
-                # predict_proba returns [[prob_class_0, prob_class_1]]
-                # We want the probability of winning (class 1)
-                prediction_proba = self.model.predict_proba(features_reshaped)
-                win_probability = prediction_proba[0][1]  # Probability of class 1 (win)
-                
-                # Convert to confidence score (0-100)
-                confidence = win_probability * 100
-                
-                # Adjust for data completeness
-                confidence = confidence * data_completeness
-                
-                # Create factors dict for reasoning (same as statistical)
-                factors = {
-                    'championship': features[0],
-                    'form': features[1],
-                    'team': features[2],
-                    'qualifying': features[3],
-                    'circuit': features[4]
-                }
-                
-                # Generate reasoning
-                reasoning = self.generate_reasoning(
-                    driver=driver,
-                    constructor=constructor,
-                    factors=factors,
-                    driver_standing=driver_standing,
-                    qualifying_position=qualifying_position,
-                    recent_results=recent_results,
-                    circuit_history=circuit_history
-                )
-                
-                # Add ML-specific note
-                reasoning.insert(0, f"ML Model Confidence: {confidence:.1f}%")
-                
-                # Create prediction
-                prediction = DriverPrediction(
-                    driver=driver,
-                    constructor=constructor,
-                    confidence=confidence,
-                    factors=factors,
-                    reasoning=reasoning
-                )
-                
-                predictions.append(prediction)
-                
-            except Exception as e:
-                logger.error(f"Failed to generate ML prediction for driver: {e}")
-                continue
-        
-        # Sort by confidence (highest first)
-        predictions.sort(key=lambda p: p.confidence, reverse=True)
-        
-        # Return top N predictions
-        top_predictions = predictions[:top_n]
-        
-        logger.info(f"Generated {len(predictions)} ML predictions, returning top {top_n}")
-        for i, pred in enumerate(top_predictions, 1):
-            logger.info(
-                f"{i}. {pred.driver.surname} ({pred.constructor.name}): "
-                f"{pred.confidence:.1f}% confidence"
             )
-        
-        return top_predictions
+
+        predictions.sort(key=lambda p: p.win_probability, reverse=True)
+        logger.info("ml: %d predictions for %s", len(predictions), context.race.race_name)
+        return predictions[:top_n] if top_n else predictions

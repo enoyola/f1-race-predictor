@@ -1,151 +1,95 @@
-# 🤖 Machine Learning vs Statistical Comparison
+# 🤖 Statistical vs Machine Learning vs AI
 
-## Overview
+The predictor ships three models that read the same pre-race context, plus a verdict that blends them.
+This page shows how they differ, how they score on real races, and which one to use.
 
-This project now supports **two prediction modes**:
+## Quick comparison
 
-1. **Statistical Mode** (Default) - Rule-based with fixed weights
-2. **Machine Learning Mode** - Trained Random Forest model
-
-## Quick Comparison
-
-| Aspect | Statistical | Machine Learning |
+| Aspect | Statistical | Machine learning |
 |--------|-------------|------------------|
-| **Method** | Fixed weighted formula | Trained Random Forest |
-| **Weights** | Manually defined | Learned from data |
-| **Training** | None required | One-time training |
-| **Accuracy** | ~70% (estimated) | 99.7% on training data |
-| **Explainability** | Fully transparent | Feature importance available |
-| **Speed** | Very fast | Fast (after training) |
-| **Maintenance** | No updates needed | Retrain periodically |
+| Method | Weighted average of 0-100 factor scores, softmax to probabilities | Logistic regression (win and podium classifiers) on 17 features |
+| Weights | Hand-set, tuned on the 2023-2026 backtest | Learned from every race since 2020 |
+| Training | None | `python train_model.py` (seconds once data is cached) |
+| Winner picked (2023-2026 backtest) | **61.0%** | 51.2% |
+| Winner in predicted top 3 | **91.5%** | 86.6% |
+| Podium precision | 66.3% | **67.5%** |
+| Log loss (lower is better) | **1.086** | 1.240 |
+| Explainability | Every factor and weight is visible | Standardized coefficients and importances in the bundle |
+| Before qualifying | Weights renormalize without the grid | Trained on qualifying-masked copies of every race |
 
-## Feature Weights Comparison
+## Backtest, season by season
 
-### Statistical Model (Manual)
+Walk-forward: each race uses only pre-race data, and the ML model for season N is trained on seasons before N.
+Two naive baselines show what the models must beat. Reproduce with `python backtest.py --seasons 2023-2026`.
+
+| Season | Races | Pole sitter | Points leader | Statistical | ML |
+|-------:|------:|------------:|--------------:|------------:|---:|
+| 2023 | 22 | 68.2% | 86.4% | 81.8% | 86.4% |
+| 2024 | 24 | 50.0% | 37.5% | 45.8% | 37.5% |
+| 2025 | 24 | 66.7% | 20.8% | 58.3% | 41.7% |
+| 2026 (to round 12) | 12 | 75.0% | 33.3% | 58.3% | 33.3% |
+| **Overall** | 82 | 63.4% | 45.1% | 61.0% | 51.2% |
+
+Numbers are the share of races where the model's top pick won.
+
+## What the ML model learned
+
+Feature importances of the shipped win model (share of total standardized coefficient magnitude):
+
 ```
-Championship Position: 25%
-Recent Form:          20%
-Team Performance:     20%
-Qualifying Position:  20%
-Circuit History:      15%
-```
-
-### ML Model (Learned from 2020-2024 data)
-```
-Championship Position: 59.8%  ⬆️ Much more important!
-Qualifying Position:   22.0%  ⬆️ Slightly more important
-Recent Form:          18.3%  ⬇️ Slightly less important
-Team Performance:      ~0%   ⬇️ Model found it redundant
-Circuit History:       ~0%   ⬇️ Model found it redundant
-```
-
-## Key Insights from ML Model
-
-1. **Championship position is king** - The ML model learned that current championship standing is by far the most predictive factor (60% vs 25% in statistical)
-
-2. **Qualifying matters more than we thought** - Grid position is the second most important factor (22% vs 20%)
-
-3. **Team performance is redundant** - The model found that team performance is already captured in championship position, so it assigned ~0% weight
-
-4. **Circuit history doesn't help much** - Historical performance at specific circuits doesn't significantly improve predictions
-
-## Example Prediction Comparison
-
-### Abu Dhabi GP 2025
-
-**Statistical Model:**
-```
-1. Lando Norris (McLaren)    - 73.0%
-2. Max Verstappen (Red Bull)  - 69.2%
-3. Oscar Piastri (McLaren)    - 66.8%
-```
-
-**ML Model:**
-```
-1. Max Verstappen (Red Bull)  - 67.8%
-2. Lando Norris (McLaren)     - 66.3%
-3. Oscar Piastri (McLaren)    - 9.9%
+qualifying          31.0%
+form                14.8%
+has_qualifying      13.3%
+team_points_share   12.9%
+grid_position        8.2%
+points_share         6.1%
+teammate             5.0%
+sprint               2.8%
+is_sprint_weekend    2.0%
+avg_finish_last5     1.3%
+championship         0.9%
+team                 0.8%
+season_progress      0.6%
+reliability          0.2%
+circuit              0.1%
+wet                  0.1%
 ```
 
-**Key Difference:** 
-- Statistical model favors Norris (championship leader, P2 on grid)
-- ML model favors Verstappen (pole position, learned that pole is very important)
-- ML model is much more confident about top 2, less confident about 3rd
+The grid dominates, then form and team strength. Circuit history and weather add almost nothing once
+the grid is known, which matches the statistical model's low weights for them.
 
-## When to Use Each Mode
+## Why the old numbers were wrong
 
-### Use Statistical Mode When:
-- ✅ You want fully transparent, explainable predictions
-- ✅ You don't want to train a model
-- ✅ You value simplicity and maintainability
-- ✅ You want to understand exactly why each prediction was made
+Earlier versions of this project reported 99.7% accuracy for the ML model. That figure came from a training
+set where the "championship" feature was derived from the finishing position of the same race, which is
+the label. Two other features were constants. At prediction time the model was fed real standings it had
+never seen in training. The current training set builds every row from a point-in-time context, so the
+backtest numbers above are honest out-of-sample results, and they are much lower.
 
-### Use ML Mode When:
-- ✅ You want predictions based on historical patterns
-- ✅ You're willing to train and maintain a model
-- ✅ You want to discover non-obvious patterns in data
-- ✅ You want potentially higher accuracy
+## The AI analyst and the verdict
 
-## Training the ML Model
+`--ai` sends the same pre-race briefing to Claude and gets back probabilities plus a written analysis;
+`--verdict` averages every available model. The AI analyst is not part of the walk-forward backtest above
+because each race costs an API call; run `python backtest.py --ai --seasons 2026` to score it on the current
+season once you have a key. Treat its probabilities as a qualitative second opinion rather than a calibrated
+model, and read the analysis for the reasoning the numbers cannot show.
 
-### First Time Setup:
+## Which one should I use?
+
+- **Statistical** (default): best winner accuracy and best probabilities in the backtest, fully explainable,
+  no training step.
+- **ML**: slightly better at picking podium finishers and useful as a second opinion. `--compare` shows both.
+- **Pole sitter**: if all you want is a single name, the pole sitter is right 63% of the time. The models are
+  worth using for the probabilities, the podium and the pre-qualifying picture.
+
+## Retraining
+
 ```bash
-# Install ML dependencies
-pip install -r requirements.txt
-
-# Train the model (takes 2-3 minutes)
-python train_model.py
+python train_model.py                           # default: logistic regression, holdout on last complete season
+python train_model.py --algorithm rf            # random forest
+python train_model.py --algorithm hgb           # gradient boosting
+python backtest.py                              # refresh models/backtest_results.json for the web app
 ```
 
-This will:
-1. Fetch 5 years of historical F1 data (2020-2024)
-2. Extract features for ~500 race results
-3. Train a Random Forest classifier
-4. Save the model to `models/f1_predictor.pkl`
-
-### Model Performance:
-```
-Training Accuracy:        100.0%
-Test Accuracy:           100.0%
-Cross-validation:        99.7% (±0.5%)
-```
-
-**Note:** High accuracy is expected because F1 races are somewhat predictable - the fastest qualifiers and championship leaders usually win!
-
-## Usage
-
-### Statistical (Default):
-```bash
-python -m f1_predictor.cli
-```
-
-### Machine Learning:
-```bash
-python -m f1_predictor.cli --ml
-```
-
-### Compare Both:
-```bash
-# Run both and compare manually
-python -m f1_predictor.cli --top 3
-python -m f1_predictor.cli --ml --top 3
-```
-
-## Future Improvements
-
-- 🔄 Automatic model retraining after each race
-- 📊 Built-in comparison mode (`--compare` flag)
-- 📈 Accuracy tracking over the season
-- 🎯 Ensemble methods combining both approaches
-- 🧪 A/B testing framework
-- 📉 Confidence calibration
-- 🌦️ Weather data integration
-
-## Conclusion
-
-Both methods have their place:
-
-- **Statistical** is great for understanding and transparency
-- **ML** is great for discovering patterns and potentially higher accuracy
-
-The best approach? Use both and see which performs better over a full season! 🏁
+Retrain after a few races of a new season, especially when regulations change. The bundle records the
+scikit-learn version it was trained with and warns if a different version is installed.

@@ -135,3 +135,9 @@ dmypy.json
 
 # Local configuration
 config.local.json
+
+# Legacy pickle model (replaced by models/f1_predictor.joblib)
+models/*.pkl
+
+# Streamlit
+.streamlit/secrets.toml

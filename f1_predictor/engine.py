@@ -1,473 +1,363 @@
 """
-Prediction engine orchestrator module.
+Prediction engine orchestrator.
 
-Coordinates all components to generate F1 race winner predictions.
-Handles data fetching, validation, analysis, and formatting.
+Wires together data fetching, point-in-time context building, the analyzers
+and the formatter. Used by the CLI and the Streamlit app.
 """
 
 import logging
-from datetime import datetime
-from typing import Optional, List
 import sys
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Union
+
 import requests
 
-from f1_predictor.models import (
-    Race, PredictionResult, PredictionError,
-    DriverStanding, ConstructorStanding, RaceResult, QualifyingResult
-)
-from f1_predictor.data_fetcher import F1DataFetcher
-from f1_predictor.cache import DataCache
 from f1_predictor.analyzer import PredictionAnalyzer
-from f1_predictor.formatter import ResultFormatter
+from f1_predictor.cache import DataCache
+from f1_predictor.data_fetcher import F1DataFetcher
+from f1_predictor.formatter import ResultFormatter, result_to_dict
+from f1_predictor.history import HistoricalDataStore
+from f1_predictor.models import DriverPrediction, PredictionError, PredictionResult, Race, RaceContext
+from f1_predictor.weather import WeatherClient
 
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
+
+DATA_SOURCE_F1 = "Jolpica F1 API"
+DATA_SOURCE_WEATHER = "Open-Meteo"
+MODEL_TITLES = {"statistical": "Statistical model", "ml": "ML model", "ai": "AI analyst", "verdict": "AI verdict"}
+
+
+def blend_results(context: RaceContext, results: Dict[str, PredictionResult], top_n: Optional[int] = None) -> PredictionResult:
+    """Average the win and podium probabilities of several full-field results."""
+    from f1_predictor.probability import normalize, scale_to_sum
+
+    names = [n for n in results if n != "verdict"]
+    if not names:
+        raise PredictionError("AnalysisError", "No model available to build a verdict", [], False)
+    by_driver: Dict[str, Dict[str, DriverPrediction]] = {}
+    for name in names:
+        for p in results[name].predictions:
+            by_driver.setdefault(p.driver.driver_id, {})[name] = p
+    ids = list(by_driver.keys())
+    win = normalize([sum(by_driver[d][n].win_probability for n in by_driver[d]) / len(by_driver[d]) for d in ids])
+    podium = scale_to_sum([sum(by_driver[d][n].podium_probability for n in by_driver[d]) / len(by_driver[d]) for d in ids], target=3.0, cap=1.0)
+
+    components = {d: {n: by_driver[d][n].win_probability for n in by_driver[d]} for d in ids}
+    predictions: List[DriverPrediction] = []
+    for d, p_win, p_podium in zip(ids, win, podium):
+        sample = next(iter(by_driver[d].values()))
+        parts = ", ".join(f"{MODEL_TITLES.get(n, n)} {by_driver[d][n].win_probability * 100:.1f}%" for n in by_driver[d])
+        reasoning = [f"Blend of: {parts}"]
+        ai_note = next((r for r in by_driver[d].get("ai", sample).reasoning if r.startswith("AI analyst:")), None)
+        if ai_note:
+            reasoning.append(ai_note)
+        reasoning.extend(r for r in sample.reasoning if not r.startswith(("AI analyst:", "Model win probability", "Blend of")))
+        predictions.append(DriverPrediction(
+            driver=sample.driver, constructor=sample.constructor,
+            win_probability=p_win, podium_probability=p_podium, score=p_win * 100,
+            factors=dict(sample.factors), reasoning=reasoning, grid_position=sample.grid_position,
+        ))
+    predictions.sort(key=lambda p: p.win_probability, reverse=True)
+
+    first = results[names[0]]
+    ai_result = results.get("ai")
+    notes = [f"Verdict blends {len(names)} model(s): " + ", ".join(MODEL_TITLES.get(n, n) for n in names)]
+    if "ai" not in names:
+        notes.append("AI analyst not included (unavailable)")
+    return PredictionResult(
+        race=first.race,
+        predictions=predictions[:top_n] if top_n else predictions,
+        generated_at=datetime.now(timezone.utc),
+        data_sources=first.data_sources + (["Claude"] if ai_result else []),
+        data_completeness=first.data_completeness,
+        model_name="verdict",
+        weather=first.weather,
+        qualifying_available=first.qualifying_available,
+        notes=notes + [n for n in first.notes],
+        actual_results=first.actual_results,
+        analysis=ai_result.analysis if ai_result else None,
+        components=components,
+    )
 
 
 class PredictionEngine:
-    """
-    Orchestrates the F1 race prediction process.
-    
-    Coordinates data fetching, validation, analysis, and formatting
-    to generate comprehensive race winner predictions.
-    """
-    
+    """Orchestrates the F1 race prediction process."""
+
     def __init__(
         self,
         use_cache: bool = True,
         cache_dir: str = ".f1_cache",
-        top_n: int = 3,
+        top_n: Optional[int] = 3,
         verbose: bool = False,
-        use_ml: bool = False
+        use_ml: bool = False,
+        model_path: Optional[str] = None,
+        use_weather: bool = True,
+        history_years: int = 5,
     ):
-        """
-        Initialize the prediction engine.
-        
-        Args:
-            use_cache: Whether to use data caching (default: True)
-            cache_dir: Directory for cache storage (default: ".f1_cache")
-            top_n: Number of top predictions to generate (default: 3)
-            verbose: Whether to show detailed output (default: False)
-            use_ml: Whether to use ML model instead of statistical analysis (default: False)
-        """
         self.use_cache = use_cache
         self.top_n = top_n
         self.verbose = verbose
         self.use_ml = use_ml
-        
-        # Initialize components
-        self.cache = DataCache(cache_dir) if use_cache else None
+        self.model_path = model_path
+        self.use_weather = use_weather
+
+        self.cache = DataCache(cache_dir)
         self.data_fetcher = F1DataFetcher(cache=self.cache, use_cache=use_cache)
-        
-        # Choose analyzer based on mode
-        if use_ml:
-            from f1_predictor.ml_analyzer import MLPredictionAnalyzer
-            self.analyzer = MLPredictionAnalyzer()
-            logger.info("Using ML-based prediction analyzer")
-        else:
-            self.analyzer = PredictionAnalyzer()
-            logger.info("Using statistical prediction analyzer")
-        
+        self.weather_client = WeatherClient(cache=self.cache, use_cache=use_cache) if use_weather else None
+        self.store = HistoricalDataStore(self.data_fetcher, self.weather_client, history_years=history_years)
         self.formatter = ResultFormatter()
-        
-        logger.info("Prediction engine initialized")
-        logger.info(f"Cache enabled: {use_cache}")
-        logger.info(f"Top predictions: {top_n}")
+
+        self._analyzers: Dict[str, PredictionAnalyzer] = {"statistical": PredictionAnalyzer()}
+        self.analyzer = self.get_analyzer("ml" if use_ml else "statistical")
+        logger.info("Prediction engine initialized (model=%s, cache=%s)", self.analyzer.name, use_cache)
+
+    # ------------------------------------------------------------------
+    # Analyzers
+    # ------------------------------------------------------------------
+
+    def get_analyzer(self, name: str) -> PredictionAnalyzer:
+        if name not in self._analyzers:
+            if name == "ml":
+                from f1_predictor.ml_analyzer import MLPredictionAnalyzer
+                self._analyzers[name] = MLPredictionAnalyzer(model_path=self.model_path)
+            elif name == "ai":
+                from f1_predictor.ai_analyzer import AIPredictionAnalyzer
+                self._analyzers[name] = AIPredictionAnalyzer(
+                    cache=self.cache, use_cache=self.use_cache,
+                    reference_analyzers=[self.get_analyzer("statistical"), self.get_analyzer("ml")],
+                )
+            else:
+                raise ValueError(f"Unknown model: {name}")
+        return self._analyzers[name]
+
+    @property
+    def ml_available(self) -> bool:
+        return getattr(self.get_analyzer("ml"), "model_loaded", False)
+
+    @property
+    def ai_available(self) -> bool:
+        return getattr(self.get_analyzer("ai"), "model_loaded", False)
+
+    def availability_error(self, name: str) -> Optional[str]:
+        return getattr(self.get_analyzer(name), "load_error", None)
+
+    # ------------------------------------------------------------------
+    # Race lookup
+    # ------------------------------------------------------------------
 
     def _show_progress(self, message: str) -> None:
-        """
-        Display progress indicator to user.
-        
-        Args:
-            message: Progress message to display
-        """
         if self.verbose:
             print(f"[*] {message}", file=sys.stderr)
         logger.info(message)
-    
-    def _validate_race_data(self, race: Race) -> List[str]:
-        """
-        Validate race data for completeness.
-        
-        Args:
-            race: Race object to validate
-            
-        Returns:
-            List of validation warnings (empty if all valid)
-        """
-        warnings = []
-        
-        if not race.race_name:
-            warnings.append("Race name is missing")
-        
-        if not race.circuit or not race.circuit.circuit_id:
-            warnings.append("Circuit information is incomplete")
-        
-        if not race.date:
-            warnings.append("Race date is missing")
-        
-        if race.season < 1950 or race.season > datetime.now().year + 1:
-            warnings.append(f"Race season {race.season} seems invalid")
-        
-        return warnings
-    
-    def _validate_standings_data(
-        self,
-        driver_standings: List[DriverStanding],
-        constructor_standings: List[ConstructorStanding]
-    ) -> List[str]:
-        """
-        Validate standings data for completeness.
-        
-        Args:
-            driver_standings: List of driver standings
-            constructor_standings: List of constructor standings
-            
-        Returns:
-            List of validation warnings (empty if all valid)
-        """
-        warnings = []
-        
-        if not driver_standings:
-            warnings.append("No driver standings data available")
-        elif len(driver_standings) < 10:
-            warnings.append(f"Limited driver standings data ({len(driver_standings)} drivers)")
-        
-        if not constructor_standings:
-            warnings.append("No constructor standings data available")
-        elif len(constructor_standings) < 5:
-            warnings.append(f"Limited constructor standings data ({len(constructor_standings)} teams)")
-        
-        return warnings
-    
-    def _validate_results_data(self, results: List[RaceResult]) -> List[str]:
-        """
-        Validate race results data for completeness.
-        
-        Args:
-            results: List of race results
-            
-        Returns:
-            List of validation warnings (empty if all valid)
-        """
-        warnings = []
-        
-        if not results:
-            warnings.append("No race results data available")
-        elif len(results) < 20:
-            warnings.append(f"Limited race results data ({len(results)} results)")
-        
-        return warnings
-    
-    def _log_data_quality_issues(self, warnings: List[str]) -> None:
-        """
-        Log data quality issues.
-        
-        Args:
-            warnings: List of validation warnings
-        """
-        if warnings:
-            logger.warning("Data quality issues detected:")
-            for warning in warnings:
-                logger.warning(f"  - {warning}")
 
-    def predict_next_race(self) -> PredictionResult:
-        """
-        Generate predictions for the next scheduled F1 race.
-        
-        Orchestrates the complete prediction process:
-        1. Fetch next race information
-        2. Fetch current season data (standings, results)
-        3. Fetch qualifying results (if available)
-        4. Fetch circuit history
-        5. Validate all data
-        6. Generate predictions using analyzer
-        7. Return formatted results
-        
-        Returns:
-            PredictionResult object with predictions and metadata
-            
-        Raises:
-            PredictionError: If prediction cannot be generated
-        """
+    def get_next_race(self) -> Race:
         try:
-            # Step 1: Get next race information
-            self._show_progress("Fetching next race information...")
-            try:
-                race = self.data_fetcher.get_next_race()
-            except ValueError as e:
-                raise PredictionError(
-                    error_type="DataError",
-                    message=f"Failed to retrieve next race information: {str(e)}",
-                    suggestions=[
-                        "Check if the F1 season is currently active",
-                        "Verify API connectivity",
-                        "Check if there are any scheduled races",
-                        "Try again later"
-                    ],
-                    recoverable=True
-                )
-            except requests.RequestException as e:
-                raise PredictionError(
-                    error_type="NetworkError",
-                    message=f"Network error while fetching race information: {str(e)}",
-                    suggestions=[
-                        "Check your internet connection",
-                        "Verify the API is accessible",
-                        "Try again later",
-                        "Use --no-cache flag to bypass cache"
-                    ],
-                    recoverable=True
-                )
-            
-            # Validate race data
-            race_warnings = self._validate_race_data(race)
-            if race_warnings:
-                self._log_data_quality_issues(race_warnings)
-            
-            logger.info(f"Next race: {race.race_name} at {race.circuit.circuit_name}")
-            logger.info(f"Date: {race.date.strftime('%Y-%m-%d')}")
-            
-            # Step 2: Get current season standings
-            self._show_progress("Fetching driver and constructor standings...")
-            try:
-                driver_standings = self.data_fetcher.get_driver_standings(race.season)
-                constructor_standings = self.data_fetcher.get_constructor_standings(race.season)
-            except requests.RequestException as e:
-                raise PredictionError(
-                    error_type="NetworkError",
-                    message=f"Network error while fetching standings: {str(e)}",
-                    suggestions=[
-                        "Check your internet connection",
-                        "Verify the API is accessible",
-                        "Try again later",
-                        "Use --no-cache flag to bypass cache"
-                    ],
-                    recoverable=True
-                )
-            except Exception as e:
-                raise PredictionError(
-                    error_type="DataError",
-                    message=f"Failed to retrieve standings data: {str(e)}",
-                    suggestions=[
-                        "Check if the F1 season has started",
-                        "Verify API is returning valid data",
-                        "Try again later"
-                    ],
-                    recoverable=True
-                )
-            
-            # Validate standings data
-            standings_warnings = self._validate_standings_data(
-                driver_standings, constructor_standings
-            )
-            if standings_warnings:
-                self._log_data_quality_issues(standings_warnings)
-            
-            if not driver_standings:
-                raise PredictionError(
-                    error_type="MissingData",
-                    message="Cannot generate predictions without driver standings data",
-                    suggestions=[
-                        "Check if the F1 season has started",
-                        "Verify API connectivity",
-                        "Try again later"
-                    ],
-                    recoverable=False
-                )
-            
-            logger.info(f"Loaded {len(driver_standings)} driver standings")
-            logger.info(f"Loaded {len(constructor_standings)} constructor standings")
-            
-            # Step 3: Get current season results for form calculation
-            self._show_progress("Fetching current season race results...")
-            try:
-                season_results = self.data_fetcher.get_current_season_results(race.season)
-            except requests.RequestException as e:
-                logger.warning(f"Network error fetching season results: {e}")
-                logger.warning("Predictions will be generated with limited form data")
-                season_results = []
-            except Exception as e:
-                logger.warning(f"Failed to fetch season results: {e}")
-                logger.warning("Predictions will be generated with limited form data")
-                season_results = []
-            
-            # Validate results data
-            results_warnings = self._validate_results_data(season_results)
-            if results_warnings:
-                self._log_data_quality_issues(results_warnings)
-            
-            logger.info(f"Loaded {len(season_results)} race results from current season")
-            
-            # Step 4: Get qualifying results (may not be available yet)
-            self._show_progress("Fetching qualifying results...")
-            qualifying_results = []
-            try:
-                qualifying_results = self.data_fetcher.get_qualifying_results(
-                    race.season, race.round
-                )
-                if qualifying_results:
-                    logger.info(f"Loaded {len(qualifying_results)} qualifying results")
-                else:
-                    logger.info("Qualifying results not yet available")
-            except requests.RequestException as e:
-                logger.warning(f"Network error fetching qualifying results: {e}")
-                logger.info("Predictions will be generated without qualifying data")
-            except Exception as e:
-                logger.warning(f"Unexpected error fetching qualifying results: {e}")
-                logger.info("Predictions will be generated without qualifying data")
-            
-            # Step 5: Get circuit history
-            self._show_progress("Fetching circuit history...")
-            circuit_history = []
-            try:
-                circuit_history = self.data_fetcher.get_circuit_history(
-                    race.circuit.circuit_id, years=5
-                )
-                if circuit_history:
-                    logger.info(f"Loaded {len(circuit_history)} historical results for circuit")
-                else:
-                    logger.info("No circuit history available")
-            except requests.RequestException as e:
-                logger.warning(f"Network error fetching circuit history: {e}")
-                logger.info("Predictions will be generated without circuit history")
-            except Exception as e:
-                logger.warning(f"Unexpected error fetching circuit history: {e}")
-                logger.info("Predictions will be generated without circuit history")
-            
-            # Step 6: Generate predictions
-            self._show_progress("Analyzing data and generating predictions...")
-            predictions = self.analyzer.analyze(
-                race=race,
-                driver_standings=driver_standings,
-                constructor_standings=constructor_standings,
-                recent_results=season_results,
-                qualifying_results=qualifying_results,
-                circuit_history=circuit_history,
-                top_n=self.top_n
-            )
-            
-            if not predictions:
-                raise PredictionError(
-                    error_type="AnalysisError",
-                    message="Failed to generate predictions from available data",
-                    suggestions=[
-                        "Check data quality",
-                        "Verify sufficient historical data exists",
-                        "Try again later"
-                    ],
-                    recoverable=False
-                )
-            
-            logger.info(f"Generated {len(predictions)} predictions")
-            
-            # Step 7: Calculate data completeness
-            data_completeness = self._calculate_data_completeness(
-                qualifying_results, circuit_history
-            )
-            
-            # Step 8: Create prediction result
-            result = PredictionResult(
-                race=race,
-                predictions=predictions,
-                generated_at=datetime.utcnow(),
-                data_sources=["Jolpica F1 API"],
-                data_completeness=data_completeness
-            )
-            
-            self._show_progress("Prediction generation complete!")
-            
-            return result
-            
-        except PredictionError:
-            # Re-raise prediction errors as-is
-            raise
-            
-        except Exception as e:
-            logger.error(f"Unexpected error during prediction: {e}", exc_info=True)
+            return self.data_fetcher.get_next_race()
+        except ValueError as e:
             raise PredictionError(
-                error_type="UnexpectedError",
-                message=f"An unexpected error occurred: {str(e)}",
-                suggestions=[
-                    "Check your internet connection",
-                    "Verify the API is accessible",
-                    "Check logs for more details",
-                    "Try again later"
-                ],
-                recoverable=True
+                error_type="DataError",
+                message=f"Failed to retrieve next race information: {e}",
+                suggestions=["Check if the F1 season is currently active", "Try again later"],
+                recoverable=True,
             )
+        except requests.RequestException as e:
+            raise self._network_error(e)
 
-    def _calculate_data_completeness(
-        self,
-        qualifying_results: Optional[List[QualifyingResult]],
-        circuit_history: Optional[List[RaceResult]]
-    ) -> float:
+    def current_season(self) -> int:
+        return self.data_fetcher.get_current_season()
+
+    def get_schedule(self, season: int) -> List[Race]:
+        try:
+            return self.store.schedule(season)
+        except requests.RequestException as e:
+            raise self._network_error(e)
+
+    def completed_rounds(self, season: int) -> List[int]:
+        return self.store.completed_rounds(season)
+
+    def resolve_race(self, selector: Union[int, str], season: Optional[int] = None) -> Race:
         """
-        Calculate data completeness factor.
-        
-        Tracks which data sources are available:
-        - Driver standings (always required)
-        - Constructor standings (always required)
-        - Season results (always required)
-        - Qualifying results (optional)
-        - Circuit history (optional)
-        
-        Args:
-            qualifying_results: Qualifying results if available
-            circuit_history: Circuit history if available
-            
-        Returns:
-            Data completeness factor from 0.0 to 1.0
+        Find a race by round number or by a name fragment.
+
+        Matches the race name, circuit name, circuit id, locality or country,
+        case-insensitively.
         """
-        total_sources = 5
-        available_sources = 3  # Standings and season results always available
-        
-        if qualifying_results is not None and len(qualifying_results) > 0:
-            available_sources += 1
-        
-        if circuit_history is not None and len(circuit_history) > 0:
-            available_sources += 1
-        
-        return available_sources / total_sources
-    
+        season = season or self.current_season()
+        schedule = self.get_schedule(season)
+        if not schedule:
+            raise PredictionError("DataError", f"No schedule found for {season}", ["Check the season year"], True)
+
+        text = str(selector).strip()
+        if text.isdigit():
+            rnd = int(text)
+            for race in schedule:
+                if race.round == rnd:
+                    return race
+            raise PredictionError("DataError", f"Round {rnd} does not exist in {season} ({len(schedule)} rounds)", [], True)
+
+        needle = text.lower()
+        matches = [
+            r for r in schedule
+            if needle in r.race_name.lower()
+            or needle in r.circuit.circuit_name.lower()
+            or needle in r.circuit.circuit_id.lower()
+            or needle in r.circuit.location.lower()
+            or needle in r.circuit.country.lower()
+        ]
+        if not matches:
+            names = ", ".join(r.race_name for r in schedule)
+            raise PredictionError("DataError", f"No {season} race matches '{selector}'", [f"Available races: {names}"], True)
+        if len(matches) > 1:
+            exact = [r for r in matches if r.race_name.lower() == needle]
+            if len(exact) == 1:
+                return exact[0]
+            names = ", ".join(f"{r.race_name} (round {r.round})" for r in matches)
+            raise PredictionError("DataError", f"'{selector}' matches several races: {names}", ["Use the round number instead"], True)
+        return matches[0]
+
+    # ------------------------------------------------------------------
+    # Prediction
+    # ------------------------------------------------------------------
+
+    def build_context(self, season: int, round_num: int, include_actual: bool = True) -> RaceContext:
+        self._show_progress(f"Loading data for {season} round {round_num}...")
+        try:
+            return self.store.build_context(season, round_num, include_actual=include_actual, use_weather=self.use_weather)
+        except requests.RequestException as e:
+            raise self._network_error(e)
+        except ValueError as e:
+            raise PredictionError("DataError", str(e), ["Check the season and round"], True)
+
+    def predict_context(self, context: RaceContext, analyzer: Optional[PredictionAnalyzer] = None, top_n: Optional[int] = -1) -> PredictionResult:
+        """Predict a race from a prepared context (top_n=-1 means use the engine default)."""
+        analyzer = analyzer or self.analyzer
+        top_n = self.top_n if top_n == -1 else top_n
+        if not context.entries:
+            raise PredictionError(
+                error_type="MissingData",
+                message=f"No entry list could be determined for {context.race.race_name}",
+                suggestions=["The season may not have started yet", "Try again once qualifying has run"],
+                recoverable=False,
+            )
+        self._show_progress(f"Analyzing {context.race.race_name} with the {analyzer.name} model...")
+        predictions = analyzer.analyze(context)
+        if not predictions:
+            raise PredictionError("AnalysisError", "Failed to generate predictions", ["Check data quality"], False)
+
+        sources = [DATA_SOURCE_F1]
+        if context.weather is not None:
+            sources.append(DATA_SOURCE_WEATHER)
+        if analyzer.name == "ai" and getattr(analyzer, "model_loaded", False):
+            sources.append(f"Claude ({getattr(analyzer, 'model', 'claude')})")
+        notes = list(context.notes)
+        loaded = getattr(analyzer, "model_loaded", True)
+        if not loaded:
+            notes.append(f"{MODEL_TITLES.get(analyzer.name, analyzer.name)} unavailable, statistical model used ({getattr(analyzer, 'load_error', None)})")
+        model_name = analyzer.name if loaded else "statistical"
+        analysis = getattr(analyzer, "last_analysis", None) if loaded else None
+
+        return PredictionResult(
+            race=context.race,
+            predictions=predictions[:top_n] if top_n else predictions,
+            generated_at=datetime.now(timezone.utc),
+            data_sources=sources,
+            data_completeness=self._data_completeness(context),
+            model_name=model_name,
+            weather=context.weather,
+            qualifying_available=context.has_qualifying,
+            notes=notes,
+            actual_results=context.actual_results,
+            analysis=analysis,
+        )
+
+    def predict_race(self, season: int, round_num: int, model: Optional[str] = None) -> PredictionResult:
+        analyzer = self.get_analyzer(model) if model else self.analyzer
+        context = self.build_context(season, round_num)
+        return self.predict_context(context, analyzer)
+
+    def predict_next_race(self, model: Optional[str] = None) -> PredictionResult:
+        race = self.get_next_race()
+        logger.info("Next race: %s (%s round %d)", race.race_name, race.season, race.round)
+        return self.predict_race(race.season, race.round, model)
+
+    def compare(self, season: int, round_num: int, models: Optional[List[str]] = None) -> Dict[str, PredictionResult]:
+        """Run several models on the same context."""
+        if models is None:
+            models = ["statistical", "ml"] + (["ai"] if self.ai_available else [])
+        context = self.build_context(season, round_num)
+        return {name: self.predict_context(context, self.get_analyzer(name)) for name in models}
+
+    def verdict(self, season: int, round_num: int) -> Dict[str, PredictionResult]:
+        """
+        Run every model and blend them into a final verdict.
+
+        Returns the individual results plus a "verdict" entry whose win
+        probabilities are the mean of the available models (renormalized).
+        """
+        context = self.build_context(season, round_num)
+        results: Dict[str, PredictionResult] = {}
+        for name in ("statistical", "ml", "ai"):
+            analyzer = self.get_analyzer(name)
+            if not getattr(analyzer, "model_loaded", True):
+                continue
+            results[name] = self.predict_context(context, analyzer, top_n=None)  # full field for blending
+        results["verdict"] = blend_results(context, results, top_n=self.top_n)
+        if self.top_n:
+            for name in list(results):
+                if name != "verdict":
+                    results[name].predictions = results[name].predictions[: self.top_n]
+        return results
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _data_completeness(context: RaceContext) -> float:
+        checks = [
+            bool(context.driver_standings),
+            bool(context.recent_results),
+            context.has_qualifying,
+            bool(context.circuit_history),
+            context.weather is not None,
+        ]
+        return sum(checks) / len(checks)
+
+    @staticmethod
+    def _network_error(e: Exception) -> PredictionError:
+        return PredictionError(
+            error_type="NetworkError",
+            message=f"Network error while fetching data: {e}",
+            suggestions=["Check your internet connection", "Try again later", "Cached data is used when available"],
+            recoverable=True,
+        )
+
+    def refresh_season(self, season: int) -> int:
+        """Drop cached data for a season so the next call refetches it."""
+        removed = 0
+        for prefix in (f"season_results_{season}", f"season_sprints_{season}", f"season_qualifying_{season}",
+                       f"schedule_{season}", "next_race", f"weather_{season}_"):
+            removed += self.cache.clear(prefix=prefix)
+        self.store.invalidate(season)
+        return removed
+
+    # ------------------------------------------------------------------
+    # Formatting
+    # ------------------------------------------------------------------
+
     def format_result(self, result: PredictionResult) -> str:
-        """
-        Format prediction result for display.
-        
-        Args:
-            result: PredictionResult to format
-            
-        Returns:
-            Formatted string ready for display
-        """
         return self.formatter.format_prediction(result, verbose=self.verbose)
-    
+
+    def format_comparison(self, results: Dict[str, PredictionResult]) -> str:
+        return self.formatter.format_comparison(results, top_n=self.top_n or 10)
+
+    def to_dict(self, result: PredictionResult) -> dict:
+        return result_to_dict(result)
+
     def format_error(self, error: PredictionError) -> str:
-        """
-        Format prediction error for display.
-        
-        Args:
-            error: PredictionError to format
-            
-        Returns:
-            Formatted error message string
-        """
-        lines = []
-        lines.append("═" * 65)
-        lines.append(f"ERROR: {error.error_type}")
-        lines.append("═" * 65)
-        lines.append(f"\n{error.message}\n")
-        
+        lines = ["═" * 65, f"ERROR: {error.error_type}", "═" * 65, "", error.message, ""]
         if error.suggestions:
             lines.append("Suggestions:")
-            for suggestion in error.suggestions:
-                lines.append(f"  • {suggestion}")
-        
-        lines.append("\n" + "═" * 65)
-        
+            lines.extend(f"  • {s}" for s in error.suggestions)
+        lines.append("═" * 65)
         return "\n".join(lines)

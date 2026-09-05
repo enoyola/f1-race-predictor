@@ -1,308 +1,132 @@
 """
-Train ML model for F1 race prediction.
+Train the ML model for F1 race prediction.
 
-This script fetches historical F1 data, extracts features, and trains
-a Random Forest classifier to predict race winners.
+Builds point-in-time features for every completed race in the chosen seasons,
+reports out-of-sample accuracy on a holdout season, then retrains on all
+seasons and saves the model bundle.
 
-Run this script once to create the model:
-    python train_model.py
-
-The trained model will be saved to models/f1_predictor.pkl
+    python train_model.py                       # seasons 2020-current, holdout = last complete season
+    python train_model.py --seasons 2021-2026 --holdout 2025
+    python train_model.py --algorithm rf        # random forest instead of logistic regression
 """
 
-import os
-import pickle
+import argparse
 import logging
+import sys
 from datetime import datetime
-from typing import List, Tuple
-import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import classification_report, accuracy_score
 
-from f1_predictor.data_fetcher import F1DataFetcher
-from f1_predictor.analyzer import PredictionAnalyzer
-from f1_predictor.models import RaceResult
+from f1_predictor.backtest import score_predictions
 from f1_predictor.cache import DataCache
-
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+from f1_predictor.data_fetcher import F1DataFetcher
+from f1_predictor.features import FEATURE_NAMES
+from f1_predictor.history import HistoricalDataStore
+from f1_predictor.training import (
+    DEFAULT_MODEL_PATH, build_training_rows, make_bundle, rows_to_arrays, save_bundle, train_models,
 )
-logger = logging.getLogger(__name__)
+from f1_predictor.weather import WeatherClient
+
+logger = logging.getLogger("train_model")
 
 
-class ModelTrainer:
-    """Trains ML model on historical F1 data."""
-    
-    def __init__(self, years_back: int = 5):
-        """
-        Initialize trainer.
-        
-        Args:
-            years_back: Number of years of historical data to use
-        """
-        self.years_back = years_back
-        cache = DataCache(".f1_cache")
-        self.fetcher = F1DataFetcher(cache=cache, use_cache=True)
-        self.analyzer = PredictionAnalyzer()
-        self.current_year = datetime.now().year
-        
-    def fetch_historical_data(self) -> List[RaceResult]:
-        """
-        Fetch historical race results for training.
-        
-        Returns:
-            List of race results from past years
-        """
-        logger.info(f"Fetching {self.years_back} years of historical data...")
-        
-        all_results = []
-        start_year = self.current_year - self.years_back
-        
-        for year in range(start_year, self.current_year):
-            try:
-                logger.info(f"Fetching season {year}...")
-                season_results = self.fetcher.get_current_season_results(year)
-                all_results.extend(season_results)
-                logger.info(f"  Loaded {len(season_results)} results from {year}")
-            except Exception as e:
-                logger.warning(f"Failed to fetch {year} season: {e}")
-                continue
-        
-        logger.info(f"Total historical results: {len(all_results)}")
-        return all_results
-    
-    def extract_features_and_labels(
-        self,
-        results: List[RaceResult]
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Extract features and labels from race results.
-        
-        For each race result, we extract:
-        - Features: [championship_score, form_score, team_score, qualifying_score, circuit_score]
-        - Label: 1 if driver won, 0 otherwise
-        
-        Args:
-            results: List of race results
-            
-        Returns:
-            Tuple of (features array, labels array)
-        """
-        logger.info("Extracting features and labels...")
-        
-        X = []  # Features
-        y = []  # Labels (1 = won, 0 = didn't win)
-        
-        # Group results by race
-        races_dict = {}
-        for result in results:
-            race_key = f"{result.race.season}_{result.race.round}"
-            if race_key not in races_dict:
-                races_dict[race_key] = []
-            races_dict[race_key].append(result)
-        
-        logger.info(f"Processing {len(races_dict)} races...")
-        
-        processed_count = 0
-        for race_key, race_results in races_dict.items():
-            try:
-                # Sort by position to identify winner
-                race_results.sort(key=lambda r: r.position)
-                
-                if not race_results:
-                    continue
-                
-                winner = race_results[0]  # Position 1
-                
-                # For each driver in the race, extract features
-                for result in race_results:
-                    # Skip if missing critical data
-                    if not result.driver or not result.constructor:
-                        continue
-                    
-                    # Extract features using analyzer methods
-                    # Note: In real training, we'd need historical standings/form
-                    # For simplicity, we'll use position-based proxies
-                    
-                    # Championship score proxy: inverse of position
-                    championship_score = max(0, 100 - (result.position * 5))
-                    
-                    # Form score proxy: based on grid position
-                    form_score = max(0, 100 - (result.grid * 5))
-                    
-                    # Team score proxy: based on constructor
-                    # (In real implementation, use actual constructor standings)
-                    team_score = 50.0  # Neutral for now
-                    
-                    # Qualifying score: based on grid position
-                    qualifying_score = self.analyzer.calculate_qualifying_impact(
-                        result.grid if result.grid > 0 else 20
-                    )
-                    
-                    # Circuit score: neutral (would need historical circuit data)
-                    circuit_score = 50.0
-                    
-                    # Create feature vector
-                    features = [
-                        championship_score,
-                        form_score,
-                        team_score,
-                        qualifying_score,
-                        circuit_score
-                    ]
-                    
-                    # Label: 1 if this driver won, 0 otherwise
-                    label = 1 if result.driver.driver_id == winner.driver.driver_id else 0
-                    
-                    X.append(features)
-                    y.append(label)
-                
-                processed_count += 1
-                if processed_count % 50 == 0:
-                    logger.info(f"  Processed {processed_count}/{len(races_dict)} races...")
-                    
-            except Exception as e:
-                logger.warning(f"Failed to process race {race_key}: {e}")
-                continue
-        
-        X_array = np.array(X)
-        y_array = np.array(y)
-        
-        logger.info(f"Extracted {len(X_array)} samples")
-        logger.info(f"  Winners: {sum(y_array)} ({sum(y_array)/len(y_array)*100:.1f}%)")
-        logger.info(f"  Non-winners: {len(y_array) - sum(y_array)}")
-        
-        return X_array, y_array
-    
-    def train_model(
-        self,
-        X: np.ndarray,
-        y: np.ndarray
-    ) -> RandomForestClassifier:
-        """
-        Train Random Forest model.
-        
-        Args:
-            X: Feature array
-            y: Label array
-            
-        Returns:
-            Trained model
-        """
-        logger.info("Training Random Forest model...")
-        
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-        
-        logger.info(f"Training set: {len(X_train)} samples")
-        logger.info(f"Test set: {len(X_test)} samples")
-        
-        # Train model
-        model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            random_state=42,
-            class_weight='balanced',  # Handle imbalanced data
-            n_jobs=-1  # Use all CPU cores
-        )
-        
-        logger.info("Fitting model...")
-        model.fit(X_train, y_train)
-        
-        # Evaluate
-        logger.info("\nModel Evaluation:")
-        logger.info("=" * 60)
-        
-        # Training accuracy
-        train_pred = model.predict(X_train)
-        train_acc = accuracy_score(y_train, train_pred)
-        logger.info(f"Training Accuracy: {train_acc:.3f}")
-        
-        # Test accuracy
-        test_pred = model.predict(X_test)
-        test_acc = accuracy_score(y_test, test_pred)
-        logger.info(f"Test Accuracy: {test_acc:.3f}")
-        
-        # Cross-validation
-        cv_scores = cross_val_score(model, X_train, y_train, cv=5)
-        logger.info(f"Cross-validation Accuracy: {cv_scores.mean():.3f} (+/- {cv_scores.std():.3f})")
-        
-        # Feature importance
-        logger.info("\nFeature Importance:")
-        feature_names = ['Championship', 'Form', 'Team', 'Qualifying', 'Circuit']
-        for name, importance in zip(feature_names, model.feature_importances_):
-            logger.info(f"  {name}: {importance:.3f}")
-        
-        # Classification report
-        logger.info("\nClassification Report (Test Set):")
-        logger.info("\n" + classification_report(y_test, test_pred, target_names=['No Win', 'Win']))
-        
-        return model
-    
-    def save_model(self, model: RandomForestClassifier, path: str = 'models/f1_predictor.pkl'):
-        """
-        Save trained model to disk.
-        
-        Args:
-            model: Trained model
-            path: Path to save model
-        """
-        # Create models directory if it doesn't exist
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        
-        logger.info(f"Saving model to {path}...")
-        with open(path, 'wb') as f:
-            pickle.dump(model, f)
-        
-        logger.info("Model saved successfully!")
-    
-    def run(self):
-        """Run the complete training pipeline."""
-        logger.info("=" * 60)
-        logger.info("F1 Race Predictor - ML Model Training")
-        logger.info("=" * 60)
-        
-        # Step 1: Fetch data
-        results = self.fetch_historical_data()
-        
-        if len(results) < 100:
-            logger.error("Not enough historical data to train model!")
-            logger.error("Need at least 100 race results, but got {len(results)}")
-            return
-        
-        # Step 2: Extract features
-        X, y = self.extract_features_and_labels(results)
-        
-        if len(X) < 100:
-            logger.error("Not enough training samples!")
-            return
-        
-        # Step 3: Train model
-        model = self.train_model(X, y)
-        
-        # Step 4: Save model
-        self.save_model(model)
-        
-        logger.info("=" * 60)
-        logger.info("Training complete!")
-        logger.info("You can now use the ML model with:")
-        logger.info("  python -m f1_predictor.cli --ml")
-        logger.info("=" * 60)
+def parse_seasons(text: str):
+    if "-" in text:
+        a, b = text.split("-", 1)
+        return list(range(int(a), int(b) + 1))
+    return [int(x) for x in text.split(",")]
 
 
-def main():
-    """Main entry point."""
-    trainer = ModelTrainer(years_back=5)
-    trainer.run()
+def evaluate_holdout(store, rows, holdout: int, algorithm: str, use_weather: bool) -> dict:
+    """Train on seasons before the holdout, score every holdout race."""
+    from f1_predictor.backtest import ModelMetrics
+    from f1_predictor.ml_analyzer import MLPredictionAnalyzer
+
+    train_rows = [r for r in rows if r.season < holdout]
+    if len(train_rows) < 200:
+        logger.warning("Not enough rows before %s to evaluate a holdout", holdout)
+        return {}
+    X, y_win, y_podium = rows_to_arrays(train_rows)
+    win_model, podium_model = train_models(X, y_win, y_podium, algorithm=algorithm)
+    analyzer = MLPredictionAnalyzer(bundle=make_bundle(win_model, podium_model, [], len(train_rows), algorithm=algorithm))
+
+    totals = ModelMetrics()
+    data = store.load_season(holdout, with_qualifying=True)
+    for rnd in data.completed_rounds:
+        context = store.build_context(holdout, rnd, include_actual=True, use_weather=use_weather)
+        preds = analyzer.analyze(context)
+        totals.add(score_predictions(preds, context.actual_results or []))
+    metrics = totals.to_dict()
+    metrics["holdout_season"] = holdout
+    metrics["train_rows"] = len(train_rows)
+    return metrics
 
 
-if __name__ == '__main__':
-    main()
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Train the F1 predictor ML model")
+    parser.add_argument("--seasons", default=None, help="Seasons to train on, e.g. 2020-2026 or 2021,2022 (default: 2020-current)")
+    parser.add_argument("--holdout", type=int, default=None, help="Season to evaluate on before the final fit (default: last complete season)")
+    parser.add_argument("--no-holdout", action="store_true", help="Skip the holdout evaluation")
+    parser.add_argument("--algorithm", choices=["logreg", "rf", "hgb"], default="logreg")
+    parser.add_argument("--no-weather", action="store_true")
+    parser.add_argument("--no-augment", action="store_true", help="Do not add qualifying-masked copies of each race")
+    parser.add_argument("--output", default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--cache-dir", default=".f1_cache")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO if args.debug else logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    cache = DataCache(args.cache_dir)
+    fetcher = F1DataFetcher(cache=cache)
+    weather = None if args.no_weather else WeatherClient(cache=cache)
+    store = HistoricalDataStore(fetcher, weather)
+
+    current = fetcher.get_current_season()
+    seasons = parse_seasons(args.seasons) if args.seasons else list(range(2020, current + 1))
+    holdout = args.holdout or max(s for s in seasons if s < current) if any(s < current for s in seasons) else None
+    if args.no_holdout:
+        holdout = None
+
+    print("F1 Race Predictor - model training")
+    print("=" * 60)
+    print(f"Seasons:   {seasons[0]}-{seasons[-1]}   holdout: {holdout or 'none'}   algorithm: {args.algorithm}")
+    print(f"Features:  {len(FEATURE_NAMES)}  ({', '.join(FEATURE_NAMES)})")
+    print()
+
+    started = datetime.now()
+
+    def progress(msg: str) -> None:
+        print(f"  {msg}")
+
+    print("Building point-in-time training rows...")
+    rows = build_training_rows(store, seasons, use_weather=not args.no_weather, augment_masked=not args.no_augment, progress=progress)
+    if len(rows) < 200:
+        print(f"ERROR: only {len(rows)} training rows, need at least 200", file=sys.stderr)
+        return 1
+    wins = sum(r.won for r in rows)
+    print(f"\n{len(rows)} rows from {len({(r.season, r.round) for r in rows})} races; {wins} winner rows; API requests: {fetcher.request_count}")
+
+    metrics = {}
+    if holdout:
+        print(f"\nHoldout evaluation on {holdout} (trained on earlier seasons only):")
+        metrics = evaluate_holdout(store, rows, holdout, args.algorithm, not args.no_weather)
+        if metrics:
+            print(f"  races {metrics['races']}  top-1 {metrics['top1_accuracy']*100:.1f}%  winner in top-3 {metrics['winner_in_top3']*100:.1f}%  "
+                  f"podium precision {metrics['podium_precision']*100:.1f}%  log loss {metrics['log_loss']:.3f}")
+
+    print("\nFitting final model on all seasons...")
+    X, y_win, y_podium = rows_to_arrays(rows)
+    win_model, podium_model = train_models(X, y_win, y_podium, algorithm=args.algorithm)
+    bundle = make_bundle(win_model, podium_model, seasons, len(rows), metrics=metrics, algorithm=args.algorithm)
+    path = save_bundle(bundle, args.output)
+
+    if bundle.get("feature_importances"):
+        print("\nFeature importance (win model):")
+        for name, value in sorted(bundle["feature_importances"].items(), key=lambda kv: kv[1], reverse=True):
+            print(f"  {name:<20} {value*100:5.1f}%")
+
+    print(f"\nSaved {path}  ({(datetime.now() - started).seconds}s)")
+    print("Use it with:  python -m f1_predictor.cli --ml")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

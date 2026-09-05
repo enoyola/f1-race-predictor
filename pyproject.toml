@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "f1-race-predictor"
-version = "1.0.0"
-description = "Predict F1 race winners using historical data and statistical analysis"
+version = "1.1.0"
+description = "Predict F1 race winners from standings, form, qualifying, circuit history and weather"
 readme = "README.md"
 authors = [
-    { name = "F1 Predictor Team", email = "your.email@example.com" }
+    { name = "enoyola" }
 ]
 license = { text = "MIT" }
 classifiers = [
@@ -16,22 +16,32 @@ classifiers = [
     "Intended Audience :: End Users/Desktop",
     "Topic :: Games/Entertainment",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-keywords = ["f1", "formula1", "racing", "prediction", "statistics"]
-requires-python = ">=3.8"
+keywords = ["f1", "formula1", "racing", "prediction", "statistics", "machine-learning"]
+requires-python = ">=3.9"
 dependencies = [
     "requests>=2.31.0",
-    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scikit-learn>=1.3.0",
+    "joblib>=1.3.0",
 ]
 
 [project.optional-dependencies]
+ai = [
+    "anthropic>=1.0.0",
+]
+ui = [
+    "pandas>=2.0.0",
+    "streamlit>=1.30.0",
+    "plotly>=5.18.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -41,9 +51,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/f1-race-predictor"
-Repository = "https://github.com/yourusername/f1-race-predictor"
-Issues = "https://github.com/yourusername/f1-race-predictor/issues"
+Homepage = "https://github.com/enoyola/f1-race-predictor"
+Repository = "https://github.com/enoyola/f1-race-predictor"
+Issues = "https://github.com/enoyola/f1-race-predictor/issues"
 
 [project.scripts]
 f1-predictor = "f1_predictor.cli:main"
@@ -54,8 +64,8 @@ include = ["f1_predictor*"]
 exclude = ["tests*"]
 
 [tool.black]
-line-length = 100
-target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+line-length = 120
+target-version = ['py39', 'py310', 'py311', 'py312', 'py313']
 include = '\.pyi?$'
 
 [tool.pytest.ini_options]
@@ -63,10 +73,10 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --cov=f1_predictor --cov-report=term-missing"
+addopts = "-q"
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
